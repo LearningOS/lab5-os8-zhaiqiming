@@ -31,12 +31,12 @@ pub fn sys_mutex_create(blocking: bool) -> isize {
         .map(|(id, _)| id)
     {
         process_inner.mutex_list[id] = mutex;
-        process_inner.banker_tester.add_mutex(id);
+        process_inner.banker_tester.available[id].0 = 1;
         id as isize
     } else {
         process_inner.mutex_list.push(mutex);
         let id = (process_inner.mutex_list.len() - 1) as usize;
-        process_inner.banker_tester.add_mutex(id);
+        process_inner.banker_tester.available[id].0 = 1;
         process_inner.mutex_list.len() as isize - 1
     }
 }
@@ -46,17 +46,22 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
     let process = current_process();
     let mut process_inner = process.inner_exclusive_access();
     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
-    process_inner.banker_tester.modify_mutex_need(sys_gettid() as usize, mutex_id, 1 as isize);
-    process_inner.banker_tester.modify_mutex_alloc(sys_gettid() as usize, mutex_id, 1 as isize);
-    
-    if process_inner.banker_tester.safety_check() != 0 {
-        process_inner.banker_tester.modify_mutex_max(sys_gettid() as usize, mutex_id, -1 as isize);
-        process_inner.banker_tester.modify_mutex_alloc(sys_gettid() as usize, mutex_id, -1 as isize);
-        println!("thread_id = {} mutex = {} mutex_safety_check fail!", sys_gettid(), mutex_id);
+    let tid = sys_gettid() as usize;
+    process_inner.banker_tester.need[tid][mutex_id].0 += 1;
+    // process_inner.banker_tester.modify_mutex_need(sys_gettid() as usize, mutex_id, 1 as isize);
+    if process_inner.banker_tester.is_run() && process_inner.banker_tester.safety_check() != 0 {
+        process_inner.banker_tester.need[tid][mutex_id].1 = 0;
+        process_inner.banker_tester.alloc[tid][mutex_id].1 = 0;
+        // println!("thread_id = {} mutex = {} mutex_safety_check fail!", sys_gettid(), mutex_id);
         drop(process_inner);
         drop(process);
         -0xDEAD as isize
     } else {
+        if process_inner.banker_tester.available[mutex_id].0 > 0 {
+            process_inner.banker_tester.need[tid][mutex_id].0 -= 1;
+            process_inner.banker_tester.alloc[tid][mutex_id].0 += 1;
+            process_inner.banker_tester.available[mutex_id].0 -= 1;
+        }
         drop(process_inner);
         drop(process);
         mutex.lock();
@@ -68,8 +73,13 @@ pub fn sys_mutex_unlock(mutex_id: usize) -> isize {
     let process = current_process();
     let mut process_inner = process.inner_exclusive_access();
     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
-    process_inner.banker_tester.modify_mutex_max(sys_gettid() as usize, mutex_id, -1 as isize);
-    process_inner.banker_tester.modify_mutex_alloc(sys_gettid() as usize, mutex_id, -1 as isize);
+    let tid = sys_gettid() as usize;
+    if process_inner.banker_tester.alloc[tid][mutex_id].0 > 0 {
+        process_inner.banker_tester.alloc[tid][mutex_id].0 -= 1;
+        process_inner.banker_tester.available[mutex_id].0 += 1;
+    } else {
+        process_inner.banker_tester.need[tid][mutex_id].0 -= 1;
+    }
     drop(process_inner);
     drop(process);
     mutex.unlock();
@@ -87,14 +97,16 @@ pub fn sys_semaphore_create(res_count: usize) -> isize {
         .map(|(id, _)| id)
     {
         process_inner.semaphore_list[id] = Some(Arc::new(Semaphore::new(res_count)));
-        process_inner.banker_tester.add_semaphore(id);
+        // process_inner.banker_tester.add_semaphore(id, res_count as isize);
+        process_inner.banker_tester.available[id].1 = res_count as isize;
         id
     } else {
         process_inner
             .semaphore_list
             .push(Some(Arc::new(Semaphore::new(res_count))));
         let id = (process_inner.semaphore_list.len() - 1) as usize;
-        process_inner.banker_tester.add_semaphore(id);
+        // process_inner.banker_tester.add_semaphore(id, res_count as isize);
+        process_inner.banker_tester.available[id].1 = res_count as isize;
         process_inner.semaphore_list.len() - 1
     };
     id as isize
@@ -102,32 +114,47 @@ pub fn sys_semaphore_create(res_count: usize) -> isize {
 
 pub fn sys_semaphore_up(sem_id: usize) -> isize {
     let process = current_process();
-    let process_inner = process.inner_exclusive_access();
+    let mut process_inner = process.inner_exclusive_access();
     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
-    // process_inner.banker_tester.modify_sem_max(sys_gettid() as usize, mutex_id, 1 as isize);
-    process_inner.banker_tester.modify_semaphore_alloc(sys_gettid() as usize, mutex_id, 1 as isize);
-    if process_inner.banker_tester.safety_check() != 0 {
-        process_inner.banker_tester.modify_semaphore_alloc(sys_gettid() as usize, mutex_id, -1 as isize);
-        drop(process_inner);
-        drop(process);
-        sys_exit(-0xDEAD);
+    let tid = sys_gettid() as usize;
+    if process_inner.banker_tester.alloc[tid][sem_id].1 > 0 {
+        process_inner.banker_tester.alloc[tid][sem_id].1 -= 1;
+        process_inner.banker_tester.available[sem_id].1 += 1;
     } else {
-        drop(process_inner);
-        drop(process);
-        sem.up();
+        process_inner.banker_tester.need[tid][sem_id].1 -= 1;
     }
+    // process_inner.banker_tester.modify_semaphore_need(sys_gettid() as usize, sem_id, -1 as isize);
+    drop(process_inner);
+    drop(process);
+    sem.up();
     0
 }
 
 // LAB5 HINT: Return -0xDEAD if deadlock is detected
 pub fn sys_semaphore_down(sem_id: usize) -> isize {
     let process = current_process();
-    let process_inner = process.inner_exclusive_access();
+    let mut process_inner = process.inner_exclusive_access();
     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
-    process_inner.banker_tester.modify_semaphore_alloc(sys_gettid() as usize, mutex_id, -1 as isize);
-    drop(process_inner);
-    sem.down();
-    0
+    let tid = sys_gettid() as usize;
+    process_inner.banker_tester.need[tid][sem_id].1 += 1;
+    // println!("TID = {} , sem down sem_id = {}", tid, sem_id);
+    if process_inner.banker_tester.is_run() && process_inner.banker_tester.safety_check() != 0 {
+        process_inner.banker_tester.need[tid][sem_id].1 = 0;
+        process_inner.banker_tester.alloc[tid][sem_id].1 = 0;
+        drop(process_inner);
+        drop(process);
+        -0xDEAD
+    } else {
+        if process_inner.banker_tester.available[sem_id].1 > 0 {
+            process_inner.banker_tester.need[tid][sem_id].1 -= 1;
+            process_inner.banker_tester.alloc[tid][sem_id].1 += 1;
+            process_inner.banker_tester.available[sem_id].1 -= 1;
+        }
+        drop(process_inner);
+        drop(process);
+        sem.down();
+        0
+    }
 }
 
 pub fn sys_condvar_create(_arg: usize) -> isize {
